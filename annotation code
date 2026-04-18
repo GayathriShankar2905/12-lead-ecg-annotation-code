@@ -1,0 +1,336 @@
+"""
+ECG 12-Lead Annotation Pipeline — Generalized Strategy
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import neurokit2 as nk
+from scipy.signal import butter, filtfilt
+
+SAMPLING_RATE = 500
+
+LEAD_CONFIG = {
+    'I':   'normal',  'II':  'normal',  'III': 'normal',
+    'aVR': 'inverted','aVL': 'normal',  'aVF': 'normal',
+    'V1':  'inverted','V2':  'inverted',
+    'V3':  'normal',  'V4':  'normal',  'V5':  'normal', 'V6': 'normal'
+}
+
+WIN = {
+    'q_before':  0.06,
+    'q_after':   0.005,
+    's_before':  0.005,
+    's_after':   0.08,
+    'p_before':  0.22,
+    'p_after':   0.06,
+    't_after':   0.08,
+    't_end':     0.40,
+}
+
+# ── Per-lead overrides for leads with deep S waves bleeding into Q window ──
+LEAD_WIN_OVERRIDES = {
+    'III': {'q_before': 0.03},
+    'aVF': {'q_before': 0.03},
+}
+
+
+def bandpass_filter(signal, low=0.5, high=40.0, fs=SAMPLING_RATE):
+    nyq = fs / 2
+    b, a = butter(4, [low / nyq, high / nyq], btype='band')
+    return filtfilt(b, a, signal)
+
+
+def normalize(signal):
+    return (signal - np.mean(signal)) / (np.std(signal) + 1e-8)
+
+
+def compute_quality_score(signal, fs=SAMPLING_RATE):
+    sig = normalize(bandpass_filter(signal))
+    kernel = np.ones(int(0.1 * fs)) / int(0.1 * fs)
+    smooth = np.convolve(sig, kernel, mode='same')
+    noise = sig - smooth
+    snr = np.var(smooth) / (np.var(noise) + 1e-8)
+    try:
+        _, info = nk.ecg_process(sig, sampling_rate=fs)
+        r_peaks = info["ECG_R_Peaks"]
+        r_peaks = r_peaks[~np.isnan(r_peaks)].astype(int)
+        if len(r_peaks) < 2:
+            return 0.0
+        r_amps = np.abs(sig[r_peaks])
+        r_conf = np.mean(r_amps) / (np.std(r_amps) + 1e-8)
+        rr = np.diff(r_peaks)
+        regularity = 1.0 / (np.std(rr) / (np.mean(rr) + 1e-8) + 1e-4)
+        return snr * r_conf * regularity
+    except Exception:
+        return 0.0
+
+
+def select_best_lead(df):
+    scores = {lead: compute_quality_score(df[lead].values) for lead in df.columns}
+    print("\n📊 Lead Quality Scores:")
+    for k, v in sorted(scores.items(), key=lambda x: -x[1]):
+        bar = '█' * min(int(v / 10), 30)
+        print(f"  {k:>4}: {v:8.1f}  {bar}")
+    best = max(scores, key=scores.get)
+    print(f"\n✅ AUTO-SELECTED BEST LEAD: {best}\n")
+    return best, scores
+
+
+def detect_pqrst_full(raw_signal, mode='normal', fs=SAMPLING_RATE, lead_name=''):
+    signal = bandpass_filter(raw_signal)
+    sig_corrected = -signal if mode == 'inverted' else signal
+
+    # Apply per-lead window overrides
+    win = WIN.copy()
+    win.update(LEAD_WIN_OVERRIDES.get(lead_name, {}))
+
+    try:
+        _, info = nk.ecg_process(sig_corrected, sampling_rate=fs)
+        r_raw = info["ECG_R_Peaks"]
+        r_raw = r_raw[~np.isnan(r_raw)].astype(int)
+    except Exception as e:
+        print(f"  ⚠ R-peak detection failed: {e}")
+        return None
+
+    if len(r_raw) == 0:
+        return None
+
+    try:
+        _, waves = nk.ecg_delineate(sig_corrected, r_raw,
+                                     sampling_rate=fs, method="dwt")
+        p_lib = waves["ECG_P_Peaks"]
+        t_lib = waves["ECG_T_Peaks"]
+        p_lib = np.array(p_lib)[~np.isnan(p_lib)].astype(int)
+        t_lib = np.array(t_lib)[~np.isnan(t_lib)].astype(int)
+    except Exception:
+        p_lib = np.array([], dtype=int)
+        t_lib = np.array([], dtype=int)
+
+    results = {'R': [], 'P': [], 'Q': [], 'S': [], 'T': []}
+
+    for r_idx in r_raw:
+        hw = int(0.02 * fs)
+        r_start = max(0, r_idx - hw)
+        r_end   = min(len(sig_corrected), r_idx + hw)
+        r_local = r_start + np.argmax(sig_corrected[r_start:r_end])
+
+        # Q on corrected signal, with per-lead window
+        q_start = max(0, r_local - int(win['q_before'] * fs))
+        q_end   = max(0, r_local - int(win['q_after']  * fs))
+        q_idx   = q_start + np.argmin(sig_corrected[q_start:q_end]) if q_end > q_start else q_start
+
+        # S on corrected signal, with per-lead window
+        s_start = min(len(sig_corrected)-1, r_local + int(win['s_before'] * fs))
+        s_end   = min(len(sig_corrected),   r_local + int(win['s_after']  * fs))
+        s_idx   = s_start + np.argmin(sig_corrected[s_start:s_end]) if s_end > s_start else s_start
+
+        # P
+        p_candidates = p_lib[(p_lib > r_local - int(win['p_before'] * fs)) &
+                              (p_lib < r_local - int(win['p_after']  * fs))]
+        if len(p_candidates):
+            p_idx = p_candidates[-1]
+            pw = int(0.02 * fs)
+            ps, pe = max(0, p_idx - pw), min(len(sig_corrected), p_idx + pw)
+            p_idx = ps + np.argmax(sig_corrected[ps:pe])
+        else:
+            ps = max(0, r_local - int(win['p_before'] * fs))
+            pe = max(0, r_local - int(win['p_after']  * fs))
+            p_idx = ps + np.argmax(sig_corrected[ps:pe]) if pe > ps else ps
+
+        # T
+        t_candidates = t_lib[(t_lib > s_idx + int(win['t_after'] * fs)) &
+                              (t_lib < s_idx + int(win['t_end']   * fs))]
+        if len(t_candidates):
+            t_idx = t_candidates[0]
+            tw = int(0.02 * fs)
+            ts, te = max(0, t_idx - tw), min(len(sig_corrected), t_idx + tw)
+            t_idx = ts + np.argmax(sig_corrected[ts:te])
+        else:
+            ts = min(len(sig_corrected)-1, s_idx + int(win['t_after'] * fs))
+            te = min(len(sig_corrected),   s_idx + int(win['t_end']   * fs))
+            t_idx = ts + np.argmax(sig_corrected[ts:te]) if te > ts else ts
+
+        results['R'].append(r_local)
+        results['P'].append(p_idx)
+        results['Q'].append(q_idx)
+        results['S'].append(s_idx)
+        results['T'].append(t_idx)
+
+    return {k: np.array(v) for k, v in results.items()}
+
+
+def project_annotations(raw_signal, reference_r_peaks, mode='normal', fs=SAMPLING_RATE, lead_name=''):
+    signal = bandpass_filter(raw_signal)
+    sig_corrected = -signal if mode == 'inverted' else signal
+
+    # Apply per-lead window overrides
+    win = WIN.copy()
+    win.update(LEAD_WIN_OVERRIDES.get(lead_name, {}))
+
+    try:
+        _, waves = nk.ecg_delineate(sig_corrected, reference_r_peaks,
+                                     sampling_rate=fs, method="dwt")
+        p_lib = waves["ECG_P_Peaks"]
+        t_lib = waves["ECG_T_Peaks"]
+        p_lib = np.array(p_lib)[~np.isnan(p_lib)].astype(int)
+        t_lib = np.array(t_lib)[~np.isnan(t_lib)].astype(int)
+    except Exception:
+        p_lib = np.array([], dtype=int)
+        t_lib = np.array([], dtype=int)
+
+    results = {'R': [], 'P': [], 'Q': [], 'S': [], 'T': []}
+
+    for r_ref in reference_r_peaks:
+        hw = int(0.03 * fs)
+        rs, re = max(0, r_ref - hw), min(len(sig_corrected), r_ref + hw)
+        r_local = rs + np.argmax(sig_corrected[rs:re])
+
+        # Q on corrected signal, with per-lead window
+        qs = max(0, r_local - int(win['q_before'] * fs))
+        qe = max(0, r_local - int(win['q_after']  * fs))
+        q_idx = qs + np.argmin(sig_corrected[qs:qe]) if qe > qs else qs
+
+        # S on corrected signal, with per-lead window
+        ss = min(len(sig_corrected)-1, r_local + int(win['s_before'] * fs))
+        se = min(len(sig_corrected),   r_local + int(win['s_after']  * fs))
+        s_idx = ss + np.argmin(sig_corrected[ss:se]) if se > ss else ss
+
+        # P
+        p_c = p_lib[(p_lib > r_local - int(win['p_before'] * fs)) &
+                    (p_lib < r_local - int(win['p_after']  * fs))]
+        if len(p_c):
+            p_idx = p_c[-1]
+        else:
+            ps = max(0, r_local - int(win['p_before'] * fs))
+            pe = max(0, r_local - int(win['p_after']  * fs))
+            p_idx = ps + np.argmax(sig_corrected[ps:pe]) if pe > ps else ps
+
+        # T
+        t_c = t_lib[(t_lib > s_idx + int(win['t_after'] * fs)) &
+                    (t_lib < s_idx + int(win['t_end']   * fs))]
+        if len(t_c):
+            t_idx = t_c[0]
+        else:
+            ts = min(len(sig_corrected)-1, s_idx + int(win['t_after'] * fs))
+            te = min(len(sig_corrected),   s_idx + int(win['t_end']   * fs))
+            t_idx = ts + np.argmax(sig_corrected[ts:te]) if te > ts else ts
+
+        results['R'].append(r_local)
+        results['P'].append(p_idx)
+        results['Q'].append(q_idx)
+        results['S'].append(s_idx)
+        results['T'].append(t_idx)
+
+    return {k: np.array(v) for k, v in results.items()}
+
+
+def compute_intervals(ann, fs=SAMPLING_RATE):
+    r, p, q, s, t = ann['R'], ann['P'], ann['Q'], ann['S'], ann['T']
+    rr_ms  = np.mean(np.diff(r)) / fs * 1000  if len(r) > 1 else np.nan
+    pr_ms  = np.mean(r - p) / fs * 1000        if len(r) else np.nan
+    qrs_ms = np.mean(s - q) / fs * 1000        if len(q) else np.nan
+    qt_ms  = np.mean(t - q) / fs * 1000        if len(q) else np.nan
+    return {
+        'RR_ms':  round(rr_ms,  1),
+        'PR_ms':  round(pr_ms,  1),
+        'QRS_ms': round(qrs_ms, 1),
+        'QT_ms':  round(qt_ms,  1),
+        'HR_bpm': round(60000 / rr_ms, 1) if not np.isnan(rr_ms) else np.nan,
+    }
+
+
+COLORS = {
+    'R': '#2196F3', 'P': '#FF9800', 'Q': '#4CAF50',
+    'S': '#F44336', 'T': '#9C27B0', 'ST': '#FF1744'
+}
+
+def plot_lead(raw_signal, lead, ann, title_suffix=''):
+    signal = bandpass_filter(raw_signal)
+    r, p, q, s, t = ann['R'], ann['P'], ann['Q'], ann['S'], ann['T']
+    fig, ax = plt.subplots(figsize=(16, 3.5))
+    ax.plot(signal, color='#1A237E', linewidth=0.8, alpha=0.85)
+    for key, idx in [('R', r), ('P', p), ('Q', q), ('S', s), ('T', t)]:
+        valid = idx[(idx >= 0) & (idx < len(signal))]
+        ax.scatter(valid, signal[valid], s=30, zorder=5,
+                   color=COLORS[key], label=key)
+    j_offset = int(0.04 * SAMPLING_RATE)
+    st_dur   = int(0.08 * SAMPLING_RATE)
+    for i, s_idx in enumerate(s):
+        j = s_idx + j_offset
+        end = j + st_dur
+        if end < len(signal):
+            ax.plot(range(j, end), signal[j:end],
+                    color=COLORS['ST'], linewidth=2,
+                    label='ST seg' if i == 0 else '')
+    ax.set_title(f'Lead {lead}{title_suffix}', fontsize=12, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=8, ncol=6)
+    ax.set_xlabel('Samples')
+    ax.set_ylabel('mV')
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_all_leads(df, annotations):
+    print("\n📊 ALL 12 LEADS — PROJECTED ANNOTATIONS\n")
+    for lead in df.columns:
+        ann = annotations[lead]
+        ivl = compute_intervals(ann)
+        suffix = f"  |  HR={ivl['HR_bpm']} bpm  PR={ivl['PR_ms']}ms  QRS={ivl['QRS_ms']}ms  QT={ivl['QT_ms']}ms"
+        plot_lead(df[lead].values, lead, ann, title_suffix=suffix)
+
+
+def run_pipeline(csv_path):
+    df = pd.read_csv(csv_path)
+    print(f"✅ Loaded: {df.shape[0]} samples × {df.shape[1]} leads")
+    print(f"   Leads: {list(df.columns)}")
+    print(f"   Duration: {df.shape[0]/SAMPLING_RATE:.1f}s @ {SAMPLING_RATE}Hz")
+
+    best_lead, scores = select_best_lead(df)
+
+    print(f"🔍 Annotating reference lead: {best_lead}")
+    best_mode = LEAD_CONFIG.get(best_lead, 'normal')
+    ref_ann   = detect_pqrst_full(df[best_lead].values, mode=best_mode, lead_name=best_lead)  # ← lead_name added
+
+    if ref_ann is None:
+        print("❌ Failed to annotate best lead. Check signal quality.")
+        return None
+
+    ref_r = ref_ann['R']
+    print(f"   Detected {len(ref_r)} beats")
+    ivl = compute_intervals(ref_ann)
+    print(f"   HR={ivl['HR_bpm']} bpm | PR={ivl['PR_ms']}ms | QRS={ivl['QRS_ms']}ms | QT={ivl['QT_ms']}ms")
+
+    print(f"\n📌 BEST LEAD: {best_lead}")
+    plot_lead(df[best_lead].values, best_lead, ref_ann,
+              title_suffix=f" ← REFERENCE  |  {ivl['HR_bpm']} bpm")
+
+    print("\n🔁 Projecting annotations to all leads...")
+    annotations = {}
+    for lead in df.columns:
+        if lead == best_lead:
+            annotations[lead] = ref_ann
+        else:
+            mode = LEAD_CONFIG.get(lead, 'normal')
+            annotations[lead] = project_annotations(
+                df[lead].values, ref_r, mode=mode, lead_name=lead  # ← lead_name added
+            )
+            print(f"   ✓ {lead}")
+
+    plot_all_leads(df, annotations)
+
+    print("\n📋 CLINICAL INTERVALS SUMMARY")
+    print(f"{'Lead':>5} | {'HR':>7} | {'PR ms':>7} | {'QRS ms':>7} | {'QT ms':>7}")
+    print("-" * 45)
+    for lead in df.columns:
+        ivl = compute_intervals(annotations[lead])
+        print(f"{lead:>5} | {ivl['HR_bpm']:>7} | {ivl['PR_ms']:>7} | "
+              f"{ivl['QRS_ms']:>7} | {ivl['QT_ms']:>7}")
+
+    print("\n✅ PIPELINE COMPLETE")
+    return annotations
+
+
+if __name__ == "__main__":
+    csv_path = "/kaggle/input/datasets/gayathrishankar2905/ecg-sig/E00001_12Lead_ECG_mV.csv"
+    annotations = run_pipeline(csv_path)
