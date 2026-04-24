@@ -1,0 +1,1099 @@
+"""
+ECG Signal Quality Index (SQI) — 12-Lead Consensus Beat Selection
+==================================================================
+Supervisor's strategy:
+  "When all 12 leads say YES for a beat → include it for training.
+   If even ONE lead says a beat is corrupted → exclude that beat
+   from ALL 12 leads. This ensures temporal relationships between
+   leads are preserved during training."
+
+Bug fixes in this version
+──────────────────────────
+  FIX 1: IndexError  t[e] out of bounds  → use t[min(e, len(t)-1)]
+  FIX 2: NO_STABLE_TEMPLATE for Lead III / aVF (unusual morphology)
+          → cross-lead template fallback: borrow template from Lead II
+            (or any other lead that successfully built one) and use it
+            to score beats in the failing lead.
+  FIX 3: aVF different R-peak count (different detector result)
+          → consensus alignment uses minimum beat count across leads
+
+Key change from v1
+──────────────────
+  Previous : each lead independently classified beats
+  This code: per-beat CONSENSUS across all 12 leads
+             → beat index i is clean ONLY if N_LEADS_REQUIRED leads agree
+             → the SAME beat mask is applied to every lead
+
+Usage
+─────
+  result = run_single_record(mat_path, hea_path)
+  mask   = result["consensus_beat_mask"]   # True = use for training
+  for ln, beats in result["consensus_clean_beats"].items():
+      print(ln, beats.shape)   # (n_clean, win_len) per lead
+"""
+
+# ============================================================
+# IMPORTS
+# ============================================================
+import os
+import warnings
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.gridspec as gridspec
+from scipy import signal as scipy_signal
+from scipy.io import loadmat
+import neurokit2 as nk
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# ← USER: SET YOUR FILE PATHS HERE
+# ============================================================
+MAT_PATH = "/kaggle/input/datasets/organizations/physionet/ptbxl-electrocardiography-database/WFDB/HR00004.mat"
+HEA_PATH = "/kaggle/input/datasets/organizations/physionet/ptbxl-electrocardiography-database/WFDB/HR00004.hea"
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+FS               = 500
+
+FLATLINE_STD     = 1e-3
+HR_MIN_BPM       = 35
+HR_MAX_BPM       = 220
+MAX_RR_SEC       = 3.0
+
+STABLE_CORR_THR  = 0.9   # threshold to find stable template beats
+MIN_STABLE_BEATS = 5      # consecutive beats needed to build template
+BEAT_CORR_THR    = 0.4   # per-beat threshold (matches MATLAB original)
+
+# Supervisor consensus rule.
+# Start strict (12), relax to e.g. 9 later if too many beats excluded.
+N_LEADS_REQUIRED = 12
+
+# Cross-lead template fallback order.
+# If a lead cannot build its own template, we try these leads (in order)
+# to donate a rescaled template.
+TEMPLATE_DONOR_PRIORITY = ["II", "I", "aVF", "V5", "V4", "V3",
+                            "V2", "V1", "III", "aVR", "aVL", "V6"]
+
+LEADS_12 = ["I", "II", "III", "aVR", "aVL", "aVF",
+            "V1", "V2", "V3",  "V4",  "V5",  "V6"]
+
+SAVE_DIR = "/kaggle/working"
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _safe_t(t: np.ndarray, idx: int) -> float:
+    """Return t[idx] clamped to valid range — prevents IndexError."""
+    return t[min(max(0, idx), len(t) - 1)]
+
+
+# ============================================================
+# 1. DATA LOADING
+# ============================================================
+
+def load_record(mat_path: str, hea_path: str):
+    fs         = FS
+    age        = None
+    sex        = None
+    dx         = []
+    lead_names = LEADS_12[:]
+
+    if hea_path and os.path.exists(hea_path):
+        with open(hea_path) as fh:
+            lines = fh.readlines()
+        try:
+            fs = int(lines[0].split()[2])
+        except Exception:
+            pass
+        for line in lines:
+            line = line.strip()
+            if line.startswith("#Age"):
+                try:    age = int(line.split(":")[1].strip())
+                except: pass
+            elif line.startswith("#Sex"):
+                sex = line.split(":")[1].strip()
+            elif line.startswith("#Dx"):
+                dx = [d.strip() for d in line.split(":")[1].split(",")]
+        sig_lines = [l for l in lines[1:]
+                     if l.strip() and not l.strip().startswith("#")]
+        parsed_names = []
+        for sl in sig_lines:
+            toks = sl.split()
+            if len(toks) >= 9:
+                parsed_names.append(toks[-1])
+        if parsed_names:
+            lead_names = parsed_names
+
+    mat     = loadmat(mat_path)
+    signals = mat.get("val", None)
+    if signals is None:
+        for k, v in mat.items():
+            if not k.startswith("_") and isinstance(v, np.ndarray) and v.ndim == 2:
+                signals = v
+                break
+    if signals is None:
+        raise ValueError(f"Cannot find signal array in {mat_path}")
+
+    signals = signals.astype(np.float64)
+    if np.max(np.abs(signals)) > 10:
+        signals /= 1000.0
+
+    record_id = os.path.splitext(os.path.basename(mat_path))[0]
+    meta      = {"record_id": record_id, "age": age, "sex": sex, "dx": dx}
+    return signals, fs, lead_names, meta
+
+
+
+# ============================================================
+# 2. PREPROCESSING
+# ============================================================
+
+def preprocess_ecg(sig: np.ndarray, fs: int) -> np.ndarray:
+    sig = scipy_signal.detrend(sig, type="linear")
+    b, a = scipy_signal.butter(4, [0.5, 40.0], btype="bandpass", fs=fs)
+    sig  = scipy_signal.filtfilt(b, a, sig)
+    b_n, a_n = scipy_signal.iirnotch(50.0, Q=30, fs=fs)
+    sig  = scipy_signal.filtfilt(b_n, a_n, sig)
+    if abs(np.min(sig)) > abs(np.max(sig)) * 1.5:
+        sig = -sig
+    return sig
+
+
+# ============================================================
+# 3. R-PEAK DETECTION
+# ============================================================
+
+def detect_r_peaks(sig: np.ndarray, fs: int) -> np.ndarray:
+    try:
+        _, info = nk.ecg_peaks(sig, sampling_rate=fs)
+        r = np.array(info["ECG_R_Peaks"])
+        r = r[~np.isnan(r)].astype(int)
+        margin = int(0.1 * fs)
+        return r[(r > margin) & (r < len(sig) - margin)]
+    except Exception:
+        return np.array([], dtype=int)
+
+
+# ============================================================
+# 4. RULE-BASED HARD GATES
+# ============================================================
+
+def rule_based_check(sig: np.ndarray,
+                     r_peaks: np.ndarray,
+                     fs: int) -> tuple:
+    if np.std(sig) < FLATLINE_STD:
+        return False, "FLAT_LINE"
+    if len(r_peaks) < 2:
+        return False, "NO_R_PEAKS"
+    rr = np.diff(r_peaks) / fs
+    hr = 60.0 / rr
+    if np.any(hr < HR_MIN_BPM) or np.any(hr > HR_MAX_BPM):
+        return False, f"HR_OUT_OF_RANGE ({hr.min():.0f}–{hr.max():.0f} bpm)"
+    if np.any(rr > MAX_RR_SEC):
+        return False, f"RR_TOO_LONG ({rr.max():.2f} s)"
+    return True, "PASS"
+
+
+# ============================================================
+# 5. BEAT SEGMENTATION
+# ============================================================
+
+def segment_beats(sig: np.ndarray,
+                  r_peaks: np.ndarray,
+                  fs: int) -> tuple:
+    if len(r_peaks) < 2:
+        return np.array([]), 0
+    win_len = int(np.median(np.diff(r_peaks)))
+    half    = win_len // 2
+    matrix  = np.full((len(r_peaks), win_len), np.nan)
+    for i, r in enumerate(r_peaks):
+        s, e = r - half, r - half + win_len
+        if s >= 0 and e <= len(sig):
+            matrix[i] = sig[s:e]
+    return matrix, win_len
+
+
+# ============================================================
+# 6. INTER-BEAT CORRELATION
+# ============================================================
+
+def inter_beat_corr(bm: np.ndarray) -> np.ndarray:
+    n = bm.shape[0]
+    C = np.full(n - 1, np.nan)
+    for i in range(1, n):
+        x, y = bm[i - 1], bm[i]
+        if np.any(np.isnan(x)) or np.any(np.isnan(y)):
+            continue
+        xn = (x - x.mean()) / (x.std() + 1e-12)
+        yn = (y - y.mean()) / (y.std() + 1e-12)
+        d  = np.sqrt((xn ** 2).sum() * (yn ** 2).sum())
+        C[i - 1] = (xn * yn).sum() / (d + 1e-12)
+    return C
+
+
+# ============================================================
+# 7. TEMPLATE CREATION
+# ============================================================
+
+def build_template(bm: np.ndarray, C: np.ndarray) -> tuple:
+    """
+    Find first run of ≥ MIN_STABLE_BEATS consecutive beats with
+    inter-beat correlation > STABLE_CORR_THR and average them.
+    Returns (template array or None, stable_indices list).
+    """
+    for i in range(len(C) - MIN_STABLE_BEATS + 1):
+        w = C[i: i + MIN_STABLE_BEATS]
+        if np.all(~np.isnan(w)) and np.all(w > STABLE_CORR_THR):
+            si       = list(range(i, i + MIN_STABLE_BEATS))
+            template = np.nanmean(bm[si], axis=0)
+            return template, si
+    return None, []
+
+
+def _resample_template(template: np.ndarray,
+                       target_len: int) -> np.ndarray:
+    """Resample a template to a different window length (linear interp)."""
+    src_x = np.linspace(0, 1, len(template))
+    dst_x = np.linspace(0, 1, target_len)
+    return np.interp(dst_x, src_x, template)
+
+
+# ============================================================
+# 8. PER-BEAT CORRELATION SCORES
+# ============================================================
+
+def beat_scores(bm: np.ndarray, template: np.ndarray) -> np.ndarray:
+    n      = bm.shape[0]
+    scores = np.full(n, np.nan)
+    if template is None:
+        return scores
+    ref = (template - template.mean()) / (template.std() + 1e-12)
+    for i in range(n):
+        b = bm[i]
+        if np.any(np.isnan(b)):
+            continue
+        bn = (b - b.mean()) / (b.std() + 1e-12)
+        d  = np.sqrt((bn ** 2).sum() * (ref ** 2).sum())
+        scores[i] = (bn * ref).sum() / (d + 1e-12)
+    return scores
+
+
+
+# ============================================================
+# 9. SINGLE-LEAD SQI
+# ============================================================
+
+def lead_sqi(sig_raw: np.ndarray,
+             fs: int,
+             lead_name: str = "",
+             donor_template: np.ndarray = None) -> dict:
+    """
+    Full single-lead SQI pipeline.
+
+    Parameters
+    ----------
+    donor_template : optional pre-built template from another lead.
+                     Used as fallback when this lead cannot build its own
+                     (FIX 2 — cross-lead template for III/aVF).
+
+    Returns
+    -------
+    dict with all intermediate results + per-beat bool mask
+    (True = beat passes quality threshold for THIS lead).
+    """
+    res = dict(
+        lead=lead_name,
+        segment_ok=False,
+        fail_reason="NOT_RUN",
+        preprocessed=sig_raw.copy(),
+        r_peaks=np.array([], dtype=int),
+        beat_matrix=np.array([]),
+        win_len=0,
+        template=None,
+        stable_indices=[],
+        beat_corr_scores=np.array([]),
+        lead_beat_mask=np.array([], dtype=bool),
+        hr_mean_bpm=np.nan,
+        template_source="own",   # "own" | "donor:<lead_name>"
+    )
+
+    sig = preprocess_ecg(sig_raw, fs)
+    res["preprocessed"] = sig
+
+    r_peaks = detect_r_peaks(sig, fs)
+    res["r_peaks"] = r_peaks
+
+    passed, reason = rule_based_check(sig, r_peaks, fs)
+    res["fail_reason"] = reason
+    if not passed:
+        n = len(r_peaks)
+        res["lead_beat_mask"] = np.zeros(n, dtype=bool)
+        return res
+
+    res["segment_ok"]  = True
+    res["hr_mean_bpm"] = float(60.0 / np.mean(np.diff(r_peaks) / fs))
+
+    bm, wl = segment_beats(sig, r_peaks, fs)
+    res["beat_matrix"] = bm
+    res["win_len"]     = wl
+    if bm.size == 0:
+        res["fail_reason"]    = "BEAT_SEGMENTATION_FAILED"
+        res["lead_beat_mask"] = np.zeros(len(r_peaks), dtype=bool)
+        return res
+
+    # Try to build own template first
+    C            = inter_beat_corr(bm)
+    template, si = build_template(bm, C)
+
+    # FIX 2: cross-lead template fallback
+    if template is None and donor_template is not None:
+        # Resample donor template to match this lead's window length
+        resampled = _resample_template(donor_template, wl)
+        template  = resampled
+        si        = []   # no "stable indices" from this lead
+        res["template_source"] = "donor"
+        res["fail_reason"]     = "TEMPLATE_FROM_DONOR"
+    elif template is None:
+        res["fail_reason"]    = "NO_STABLE_TEMPLATE"
+        res["lead_beat_mask"] = np.zeros(len(r_peaks), dtype=bool)
+        return res
+
+    res["template"]       = template
+    res["stable_indices"] = si
+
+    sc = beat_scores(bm, template)
+    res["beat_corr_scores"] = sc
+
+    # Per-beat mask: NaN beats (boundary) → fail
+    mask = np.where(np.isnan(sc), False, sc >= BEAT_CORR_THR)
+    res["lead_beat_mask"] = mask
+    if res["fail_reason"] == "NOT_RUN":
+        res["fail_reason"] = "PASS"
+
+    return res
+
+
+
+# ============================================================
+# 10. 12-LEAD CONSENSUS
+# ============================================================
+
+def consensus_beat_mask(lead_results: dict) -> tuple:
+    """
+    Supervisor rule: beat i is clean only when ALL N_LEADS_REQUIRED
+    leads vote clean.
+
+    Returns
+    -------
+    consensus_mask : (n_beats,) bool
+    n_beats        : int
+    per_lead_info  : dict {lead: {"n_beats", "n_clean", "mask"}}
+    """
+    lead_masks = {}
+    for ln, lr in lead_results.items():
+        m = lr["lead_beat_mask"]
+        if len(m) > 0:
+            lead_masks[ln] = m
+
+    if not lead_masks:
+        return np.array([], dtype=bool), 0, {}
+
+    # Align: use minimum beat count across leads
+    n_beats = min(len(m) for m in lead_masks.values())
+
+    mask_matrix  = np.vstack([m[:n_beats] for m in lead_masks.values()])
+    lead_votes   = mask_matrix.sum(axis=0)
+    consensus    = lead_votes >= N_LEADS_REQUIRED
+
+    per_lead_info = {
+        ln: {
+            "n_beats": n_beats,
+            "n_clean": int(mask_matrix[i].sum()),
+            "mask":    mask_matrix[i],
+        }
+        for i, ln in enumerate(lead_masks)
+    }
+    return consensus, n_beats, per_lead_info
+
+
+# ============================================================
+# 11. FULL RECORD PIPELINE
+# ============================================================
+
+def run_single_record(mat_path: str,
+                      hea_path: str,
+                      verbose: bool = True) -> dict:
+    """
+    Complete pipeline for ONE .mat / .hea record.
+    Includes two-pass lead SQI:
+      Pass 1 — every lead tries to build its own template.
+      Pass 2 — leads that failed template building get a donor template
+               from the best available lead and are re-scored.
+    """
+    signals, fs, lead_names, meta = load_record(mat_path, hea_path)
+
+    if verbose:
+        print(f"\n{'='*65}")
+        print(f"Record : {meta['record_id']}")
+        print(f"Age    : {meta['age']}   Sex : {meta['sex']}")
+        print(f"Dx     : {', '.join(meta['dx']) if meta['dx'] else 'N/A'}")
+        print(f"Shape  : {signals.shape}   Fs : {fs} Hz   "
+              f"Duration : {signals.shape[1]/fs:.1f} s")
+        print(f"{'='*65}")
+
+    # ── PASS 1: each lead builds its own template ──────────────────────
+    lead_results = {}
+    for i, ln in enumerate(lead_names):
+        if i >= signals.shape[0]:
+            continue
+        lead_results[ln] = lead_sqi(signals[i], fs, ln, donor_template=None)
+
+    # ── Build donor template pool from successful leads ────────────────
+    donor_template = None   # best available template (will be from lead II or similar)
+    for donor_ln in TEMPLATE_DONOR_PRIORITY:
+        lr = lead_results.get(donor_ln)
+        if lr is not None and lr["template"] is not None:
+            donor_template = lr["template"]
+            donor_lead     = donor_ln
+            break
+
+    # ── PASS 2: re-run failed leads using donor template ───────────────
+    needs_rerun = [
+        ln for ln, lr in lead_results.items()
+        if lr["template"] is None and lr["segment_ok"]
+    ]
+
+    if needs_rerun and donor_template is not None:
+        if verbose:
+            print(f"\n  [Cross-lead fallback] Donor: {donor_lead}  "
+                  f"→ re-scoring leads: {needs_rerun}")
+        for ln in needs_rerun:
+            i = lead_names.index(ln)
+            lead_results[ln] = lead_sqi(signals[i], fs, ln,
+                                        donor_template=donor_template)
+
+    if verbose:
+        for ln in lead_names:
+            lr = lead_results.get(ln)
+            if lr is None: continue
+            n_ok  = int(lr["lead_beat_mask"].sum())
+            n_tot = len(lr["lead_beat_mask"])
+            stat  = "PASS" if lr["segment_ok"] else "FAIL"
+            tsrc  = lr.get("template_source", "own")
+            tsrc_str = f" [tmpl←{donor_lead}]" if tsrc == "donor" else ""
+            print(f"  Lead {ln:>4s} [{stat}]  "
+                  f"HR={lr['hr_mean_bpm']:5.1f} bpm  "
+                  f"Beats: {n_ok:3d}/{n_tot:3d} clean  "
+                  f"| {lr['fail_reason']}{tsrc_str}")
+
+    # ── Consensus ──────────────────────────────────────────────────────
+    consensus_mask, n_beats, per_lead_info = consensus_beat_mask(lead_results)
+    n_clean    = int(consensus_mask.sum())
+    n_excluded = n_beats - n_clean
+    pct_clean  = 100.0 * n_clean / n_beats if n_beats > 0 else 0.0
+
+    if verbose:
+        print(f"\n{'─'*65}")
+        print(f"  CONSENSUS (rule: all {N_LEADS_REQUIRED}/12 leads must agree)")
+        print(f"  Total beats evaluated  : {n_beats}")
+        print(f"  Clean beats (training) : {n_clean}  ({pct_clean:.1f}%)")
+        print(f"  Excluded beats         : {n_excluded}")
+        print(f"  Per-beat vote summary  :")
+        for ln, info in per_lead_info.items():
+            pct = 100.0 * info["n_clean"] / info["n_beats"] \
+                  if info["n_beats"] else 0
+            print(f"    Lead {ln:>4s}: {info['n_clean']:3d}/{info['n_beats']:3d} "
+                  f"clean ({pct:.1f}%)")
+        print(f"{'─'*65}\n")
+
+    # ── Extract consensus-gated beat windows ───────────────────────────
+    consensus_clean_beats = {}
+    r_peaks_ref = np.array([], dtype=int)
+
+    for ln, lr in lead_results.items():
+        bm = lr["beat_matrix"]
+        if bm.size == 0 or len(consensus_mask) == 0:
+            consensus_clean_beats[ln] = np.empty((0, 0))
+            continue
+        n   = min(bm.shape[0], len(consensus_mask))
+        sub = bm[:n]
+        msk = consensus_mask[:n]
+        valid = msk & (~np.any(np.isnan(sub), axis=1))
+        consensus_clean_beats[ln] = sub[valid]
+
+        if ln == "II" or (ln == lead_names[0] and r_peaks_ref.size == 0):
+            r_peaks_ref = lr["r_peaks"][:n][valid]
+
+    return dict(
+        meta                  = meta,
+        lead_results          = lead_results,
+        consensus_beat_mask   = consensus_mask,
+        consensus_clean_beats = consensus_clean_beats,
+        n_beats_total         = n_beats,
+        n_beats_clean         = n_clean,
+        n_beats_excluded      = n_excluded,
+        pct_clean             = pct_clean,
+        per_lead_vote_info    = per_lead_info,
+        r_peaks_ref           = r_peaks_ref,
+        fs                    = fs,
+        lead_names            = lead_names,
+        signals               = signals,
+    )
+
+
+# ============================================================
+# 12. VISUALISATION HELPERS
+# ============================================================
+
+def _build_ref_ts(sig, r_peaks, template, win_len):
+    """Reconstruct continuous reference time-series for plotting."""
+    ref  = np.full(len(sig), np.nan)
+    half = win_len // 2
+    for r in r_peaks:
+        s, e = r - half, r - half + win_len
+        # FIX 1: clamp e to len(sig)
+        if 0 <= s and e <= len(sig):
+            ref[s:e] = template
+    return ref
+
+
+def _axvspan_safe(ax, t, s, e, **kwargs):
+    """
+    Draw axvspan between t[s] and t[e] safely.
+    FIX 1: clamp indices to [0, len(t)-1].
+    """
+    s_clamped = min(max(0, s), len(t) - 1)
+    e_clamped = min(max(0, e), len(t) - 1)
+    if s_clamped < e_clamped:
+        ax.axvspan(t[s_clamped], t[e_clamped], **kwargs)
+
+
+# ============================================================
+# 13. SINGLE-LEAD PPG-STYLE PLOT
+# ============================================================
+
+def plot_single_lead_ppg_style(record_result: dict,
+                                lead_name: str = "II",
+                                save_path: str = None):
+    """
+    PPG-paper Figure 3 style for ONE lead.
+
+    Row 1: Full ECG (blue) + reference (red).
+           Salmon shading = consensus-excluded beats.
+           Light green shading = stable template source region.
+           Green dashed box + arrow = zoom region.
+    Row 2: Zoomed view of first excluded beat (red dashed box).
+    Row 3: Per-beat cross-correlation (magenta dotted line).
+           Red arrows = consensus-excluded beats.
+           Green diamonds = template source beats.
+    """
+    lr = record_result["lead_results"].get(lead_name)
+    if lr is None:
+        print(f"Lead {lead_name} not found."); return None
+
+    consensus  = record_result["consensus_beat_mask"]
+    fs         = record_result["fs"]
+    meta       = record_result["meta"]
+
+    sig        = lr["preprocessed"]
+    r_peaks    = lr["r_peaks"]
+    scores     = lr["beat_corr_scores"]
+    template   = lr["template"]
+    stable_idx = lr["stable_indices"]
+    win_len    = lr["win_len"]
+    half       = win_len // 2
+
+    n      = min(len(r_peaks), len(consensus))
+    excl   = ~consensus[:n]    # True = excluded by consensus
+    n_excl = int(excl.sum())
+    t      = np.arange(len(sig)) / fs
+
+    ref_ts = (_build_ref_ts(sig, r_peaks, template, win_len)
+              if template is not None and win_len > 0 else None)
+
+    # Zoom target: first excluded beat, or mid stable window
+    zoom_r_idx = None
+    if np.any(excl):
+        zoom_r_idx = int(np.where(excl)[0][0])
+    elif stable_idx:
+        zoom_r_idx = stable_idx[len(stable_idx) // 2]
+
+    zoom_start = zoom_end = None
+    if zoom_r_idx is not None and zoom_r_idx < len(r_peaks):
+        zr         = r_peaks[zoom_r_idx]
+        zh         = int(2.0 * win_len) if win_len > 0 else int(0.4 * fs)
+        zoom_start = max(0, zr - zh)
+        zoom_end   = min(len(sig) - 1, zr + zh)   # FIX 1: -1 guard
+
+    # ── Build figure ─────────────────────────────────────────────────────
+    sqi_str = ("CLEAN" if n_excl == 0
+               else f"NOISY ({n_excl} beats excluded by consensus)")
+    fig = plt.figure(figsize=(14, 10))
+    fig.suptitle(
+        f"Record: {meta['record_id']}  |  Lead: {lead_name}  |  {sqi_str}\n"
+        f"Consensus rule: all {N_LEADS_REQUIRED}/12 leads must agree  |  "
+        f"Clean beats: {n - n_excl}/{n}",
+        fontsize=11, fontweight="bold",
+        color="#1B5E20" if n_excl == 0 else "#B71C1C",
+        y=1.01
+    )
+    gs = gridspec.GridSpec(3, 1, hspace=0.42, height_ratios=[1.6, 1.2, 1.0])
+
+    # ── Row 1: Full signal ────────────────────────────────────────────────
+    ax1 = fig.add_subplot(gs[0])
+    ax1.plot(t, sig, color="#2196F3", lw=0.9, label="Filtered ECG", zorder=2)
+    if ref_ts is not None:
+        ax1.plot(t, ref_ts, color="#E53935", lw=1.2,
+                 label="Reference Signal", zorder=3)
+
+    # Salmon shading on consensus-excluded beat windows
+    for k, idx in enumerate(np.where(excl)[0]):
+        if idx >= len(r_peaks): continue
+        r = r_peaks[idx]
+        s = max(0, r - half)
+        e = min(len(sig) - 1, r - half + win_len)   # FIX 1
+        _axvspan_safe(ax1, t, s, e, color="salmon", alpha=0.35, zorder=1,
+                      label="Consensus-excluded" if k == 0 else "")
+
+    # Light green on stable template source
+    if stable_idx and stable_idx[-1] < len(r_peaks):
+        ts_s = max(0, r_peaks[stable_idx[0]] - half)
+        ts_e = min(len(sig) - 1, r_peaks[stable_idx[-1]] + half)  # FIX 1
+        _axvspan_safe(ax1, t, ts_s, ts_e,
+                      color="lightgreen", alpha=0.25, zorder=0,
+                      label="Stable template region")
+
+    # Green dashed box around zoom region
+    if zoom_start is not None:
+        sr   = max(sig.max() - sig.min(), 1e-6)
+        rect = mpatches.FancyBboxPatch(
+            (t[zoom_start], sig.min() - 0.05 * sr),
+            t[zoom_end] - t[zoom_start], sr * 1.1,
+            boxstyle="square,pad=0", lw=2.0,
+            edgecolor="green", linestyle="--",
+            facecolor="none", zorder=5)
+        ax1.add_patch(rect)
+        mx = (t[zoom_start] + t[zoom_end]) / 2
+        ax1.annotate("", xy=(mx, sig.min() - 0.13 * sr),
+                     xytext=(mx, sig.min() - 0.03 * sr),
+                     arrowprops=dict(arrowstyle="-|>",
+                                     color="green", lw=1.8))
+
+    # Deduplicate legend
+    handles, labels = ax1.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax1.legend(by_label.values(), by_label.keys(),
+               fontsize=8, loc="upper right")
+    ax1.set_title("Filtered ECG with Reference Signal",
+                  fontsize=11, fontweight="bold")
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel("Amplitude (mV)")
+    ax1.grid(True, alpha=0.25)
+
+    # ── Row 2: Zoomed ─────────────────────────────────────────────────────
+    ax2 = fig.add_subplot(gs[1])
+    if zoom_start is not None:
+        zs, ze = zoom_start, zoom_end
+        ax2.plot(t[zs:ze + 1], sig[zs:ze + 1],
+                 color="#2196F3", lw=1.0, label="Filtered ECG")
+        if ref_ts is not None:
+            ax2.plot(t[zs:ze + 1], ref_ts[zs:ze + 1],
+                     color="#E53935", lw=1.2, label="Reference Signal")
+        # Red dashed box on the corrupted beat within zoom
+        if zoom_r_idx is not None and zoom_r_idx < len(r_peaks):
+            zr  = r_peaks[zoom_r_idx]
+            bs  = max(zs, zr - half)
+            be  = min(ze, zr - half + win_len - 1)   # FIX 1
+            if bs < be:
+                zsig = sig[zs: ze + 1]
+                zsr  = max(zsig.max() - zsig.min(), 1e-6)
+                ax2.add_patch(mpatches.FancyBboxPatch(
+                    (t[bs], zsig.min() - 0.05 * zsr),
+                    t[be] - t[bs], zsr * 1.1,
+                    boxstyle="square,pad=0", lw=2.0,
+                    edgecolor="red", linestyle="--",
+                    facecolor="none", zorder=4))
+        ax2.legend(fontsize=8, loc="upper right")
+        zoom_lbl = ("Zoomed — first consensus-excluded beat"
+                    if np.any(excl) else "Zoomed — stable template region")
+    else:
+        ax2.text(0.5, 0.5, "No zoom region available",
+                 ha="center", va="center", transform=ax2.transAxes,
+                 fontsize=10, color="gray")
+        zoom_lbl = ""
+    ax2.set_title(f"Filtered ECG — {zoom_lbl}",
+                  fontsize=11, fontweight="bold")
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Amplitude (mV)")
+    ax2.grid(True, alpha=0.25)
+
+    # ── Row 3: Cross-correlation per beat ─────────────────────────────────
+    ax3 = fig.add_subplot(gs[2])
+    if len(scores) > 0 and not np.all(np.isnan(scores)):
+        nn = min(len(r_peaks), len(scores), n)
+        bt = np.array([t[r] for r in r_peaks[:nn]])
+        sc = scores[:nn]
+        ex = excl[:nn]
+
+        ax3.plot(bt, sc, linestyle="--", marker="o",
+                 color="#CC00CC", markersize=5, lw=1.2,
+                 label="cross-correlation value", zorder=3)
+
+        # Red downward arrows on excluded beats
+        for idx in np.where(ex)[0]:
+            if not np.isnan(sc[idx]):
+                ax3.annotate("", xy=(bt[idx], sc[idx] - 0.03),
+                             xytext=(bt[idx], sc[idx] + 0.13),
+                             arrowprops=dict(arrowstyle="-|>",
+                                             color="red", lw=2.0))
+
+        # Green diamonds on template source beats
+        for si_idx in stable_idx:
+            if si_idx < nn and not np.isnan(sc[si_idx]):
+                ax3.scatter(bt[si_idx], sc[si_idx], marker="D",
+                            color="#1B5E20", s=50, zorder=5)
+
+        ax3.axhline(BEAT_CORR_THR, color="#E53935",
+                    linestyle="--", lw=1.2,
+                    label=f"Threshold T={BEAT_CORR_THR}")
+        ax3.set_ylim(-0.05, 1.10)
+        ax3.set_xlim(t[0], t[-1])
+
+        handles = [
+            plt.Line2D([0], [0], marker="o", color="#CC00CC",
+                       linestyle="--", markersize=5,
+                       label="cross-correlation value"),
+            plt.Line2D([0], [0], color="#E53935", linestyle="--",
+                       label=f"Threshold T={BEAT_CORR_THR}"),
+            plt.Line2D([0], [0], marker="D", color="w",
+                       markerfacecolor="#1B5E20", markersize=8,
+                       label="Template source beat"),
+            mpatches.Patch(color="salmon", alpha=0.7,
+                           label="Consensus-excluded"),
+        ]
+        ax3.legend(handles=handles, fontsize=7, loc="lower right")
+
+    ax3.set_title("Cross-correlation value of Each Heartbeat",
+                  fontsize=11, fontweight="bold")
+    ax3.set_xlabel("Time (s)")
+    ax3.set_ylabel("cross-correlation")
+    ax3.grid(True, alpha=0.25)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved → {save_path}")
+    plt.show()
+    return fig
+
+
+# ============================================================
+# 14. ALL-12-LEADS SUMMARY FIGURE
+# ============================================================
+
+def plot_all_leads_summary(record_result: dict,
+                            save_path: str = None):
+    """
+    12-lead ECG summary figure (4 rows × 3 cols).
+    Each cell = 3 mini sub-panels (PPG-paper style).
+    Consensus-excluded beats shown in salmon in every lead.
+    """
+    lead_results = record_result["lead_results"]
+    consensus    = record_result["consensus_beat_mask"]
+    meta         = record_result["meta"]
+    fs           = record_result["fs"]
+    n_clean      = record_result["n_beats_clean"]
+    n_total      = record_result["n_beats_total"]
+    lead_names   = record_result["lead_names"]
+
+    lead_grid = [
+        ["I",   "II",  "III"],
+        ["aVR", "aVL", "aVF"],
+        ["V1",  "V2",  "V3"],
+        ["V4",  "V5",  "V6"],
+    ]
+
+    fig = plt.figure(figsize=(24, 28))
+    fig.patch.set_facecolor("#F8F9FA")
+    outer = gridspec.GridSpec(4, 3, figure=fig,
+                               hspace=0.55, wspace=0.35,
+                               top=0.93, bottom=0.04,
+                               left=0.05, right=0.97)
+
+    for row_idx, lead_row in enumerate(lead_grid):
+        for col_idx, ln in enumerate(lead_row):
+            if ln not in lead_results:
+                continue
+
+            lr       = lead_results[ln]
+            sig      = lr["preprocessed"]
+            r_peaks  = lr["r_peaks"]
+            scores   = lr["beat_corr_scores"]
+            template = lr["template"]
+            win_len  = lr["win_len"]
+            si       = lr["stable_indices"]
+            half     = win_len // 2
+            t        = np.arange(len(sig)) / fs
+
+            n      = min(len(r_peaks), len(consensus))
+            excl   = ~consensus[:n]
+            n_excl = int(excl.sum())
+            sqi_str = "CLEAN" if n_excl == 0 else f"{n_excl} excl."
+            hdr_col = "#1B5E20" if n_excl == 0 else "#C62828"
+
+            ref_ts = (_build_ref_ts(sig, r_peaks, template, win_len)
+                      if template is not None and win_len > 0 else None)
+
+            # Zoom target
+            zoom_r_idx = None
+            if np.any(excl):
+                zoom_r_idx = int(np.where(excl)[0][0])
+            elif si:
+                zoom_r_idx = si[len(si) // 2]
+
+            zoom_start = zoom_end = None
+            if zoom_r_idx is not None and zoom_r_idx < len(r_peaks):
+                zr         = r_peaks[zoom_r_idx]
+                zh         = int(1.5 * win_len) if win_len > 0 else int(0.3 * fs)
+                zoom_start = max(0, zr - zh)
+                zoom_end   = min(len(sig) - 1, zr + zh)  # FIX 1
+
+            cell = gridspec.GridSpecFromSubplotSpec(
+                3, 1, subplot_spec=outer[row_idx, col_idx],
+                hspace=0.06, height_ratios=[1.4, 1.0, 0.8])
+
+            # ── Top ──
+            ax_top = fig.add_subplot(cell[0])
+            ax_top.plot(t, sig, color="#1565C0", lw=0.7, zorder=2)
+            if ref_ts is not None:
+                ax_top.plot(t, ref_ts, color="#E53935", lw=0.8, zorder=3)
+
+            for idx in np.where(excl)[0]:
+                if idx >= len(r_peaks): continue
+                r = r_peaks[idx]
+                s = max(0, r - half)
+                e = min(len(sig) - 1, r - half + win_len)  # FIX 1
+                _axvspan_safe(ax_top, t, s, e,
+                              color="salmon", alpha=0.35, zorder=1)
+
+            if si and si[-1] < len(r_peaks):
+                ts_s = max(0, r_peaks[si[0]] - half)
+                ts_e = min(len(sig) - 1, r_peaks[si[-1]] + half)
+                _axvspan_safe(ax_top, t, ts_s, ts_e,
+                              color="lightgreen", alpha=0.2, zorder=0)
+
+            if zoom_start is not None:
+                sr   = max(sig.max() - sig.min(), 1e-6)
+                rect = mpatches.FancyBboxPatch(
+                    (t[zoom_start], sig.min() - 0.05 * sr),
+                    t[zoom_end] - t[zoom_start], sr * 1.1,
+                    boxstyle="square,pad=0", lw=1.5,
+                    edgecolor="green", linestyle="--",
+                    facecolor="none", zorder=4, clip_on=True)
+                ax_top.add_patch(rect)
+
+            ax_top.text(0.01, 0.97, ln,
+                        transform=ax_top.transAxes,
+                        fontsize=11, fontweight="bold",
+                        color="white", va="top",
+                        bbox=dict(facecolor=hdr_col, edgecolor="none",
+                                  boxstyle="round,pad=0.3"))
+            ax_top.text(0.99, 0.97, sqi_str,
+                        transform=ax_top.transAxes,
+                        fontsize=7.5, va="top", ha="right",
+                        color=hdr_col, fontweight="bold")
+            ax_top.set_ylabel("mV", fontsize=7)
+            ax_top.tick_params(labelbottom=False, labelsize=6)
+            ax_top.grid(True, alpha=0.2)
+
+            # ── Middle ──
+            ax_mid = fig.add_subplot(cell[1])
+            if zoom_start is not None:
+                zs, ze = zoom_start, zoom_end
+                ax_mid.plot(t[zs: ze + 1], sig[zs: ze + 1],
+                            color="#1565C0", lw=0.8)
+                if ref_ts is not None:
+                    ax_mid.plot(t[zs: ze + 1], ref_ts[zs: ze + 1],
+                                color="#E53935", lw=0.9)
+                if n_excl > 0 and zoom_r_idx < len(r_peaks):
+                    zr  = r_peaks[zoom_r_idx]
+                    bs  = max(zs, zr - half)
+                    be  = min(ze, zr - half + win_len - 1)  # FIX 1
+                    if bs < be:
+                        zsig = sig[zs: ze + 1]
+                        zsr  = max(zsig.max() - zsig.min(), 1e-6)
+                        ax_mid.add_patch(mpatches.FancyBboxPatch(
+                            (t[bs], zsig.min() - 0.05 * zsr),
+                            t[be] - t[bs], zsr * 1.1,
+                            boxstyle="square,pad=0", lw=1.5,
+                            edgecolor="red", linestyle="--",
+                            facecolor="none", zorder=4))
+            else:
+                ax_mid.text(0.5, 0.5, "—", ha="center", va="center",
+                            transform=ax_mid.transAxes,
+                            fontsize=9, color="gray")
+            ax_mid.set_ylabel("mV", fontsize=7)
+            ax_mid.tick_params(labelbottom=False, labelsize=6)
+            ax_mid.grid(True, alpha=0.2)
+
+            # ── Bottom ──
+            ax_bot = fig.add_subplot(cell[2])
+            if len(scores) > 0 and not np.all(np.isnan(scores)):
+                nn  = min(len(r_peaks), len(scores), n)
+                bt  = np.array([t[r] for r in r_peaks[:nn]])
+                sc  = scores[:nn]
+                ex2 = excl[:nn]
+                ax_bot.plot(bt, sc, linestyle="--", marker="o",
+                            color="#CC00CC", markersize=3,
+                            lw=0.9, zorder=3)
+                for idx in np.where(ex2)[0]:
+                    if not np.isnan(sc[idx]):
+                        ax_bot.annotate(
+                            "", xy=(bt[idx], sc[idx] - 0.02),
+                            xytext=(bt[idx], sc[idx] + 0.09),
+                            arrowprops=dict(arrowstyle="-|>",
+                                            color="red", lw=1.4))
+                ax_bot.axhline(BEAT_CORR_THR, color="#E53935",
+                               linestyle="--", lw=0.9)
+                ax_bot.set_ylim(-0.05, 1.10)
+                ax_bot.set_xlim(t[0], t[-1])
+            ax_bot.set_ylabel("corr", fontsize=7)
+            ax_bot.set_xlabel("Time (s)", fontsize=7)
+            ax_bot.tick_params(labelsize=6)
+            ax_bot.grid(True, alpha=0.2)
+
+    dx_str = ", ".join(meta["dx"][:3]) if meta["dx"] else "N/A"
+    fig.suptitle(
+        f"12-Lead ECG SQI — Consensus Beat Selection\n"
+        f"Record: {meta['record_id']}  |  Age: {meta['age']}  "
+        f"Sex: {meta['sex']}  |  Dx: {dx_str}\n"
+        f"Consensus rule: all {N_LEADS_REQUIRED}/12 leads must agree  |  "
+        f"Clean beats: {n_clean}/{n_total} "
+        f"({100*n_clean/max(n_total, 1):.1f}%)",
+        fontsize=13, fontweight="bold", y=0.97, color="#1A237E"
+    )
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved → {save_path}")
+    plt.show()
+    return fig
+
+
+# ============================================================
+# 15. CONSENSUS VOTE SUMMARY CHART
+# ============================================================
+
+def plot_consensus_vote_summary(record_result: dict,
+                                 save_path: str = None):
+    """
+    Bar chart — how many leads voted each beat as clean.
+    Green = passes consensus, Red = fails.
+    """
+    per_lead  = record_result["per_lead_vote_info"]
+    consensus = record_result["consensus_beat_mask"]
+    n_beats   = record_result["n_beats_total"]
+    meta      = record_result["meta"]
+
+    if n_beats == 0 or not per_lead:
+        print("No beat data to plot."); return None
+
+    masks  = np.vstack([info["mask"][:n_beats]
+                        for info in per_lead.values()])
+    votes  = masks.sum(axis=0)
+    colors = ["green" if consensus[i] else "red"
+              for i in range(n_beats)]
+
+    fig, ax = plt.subplots(figsize=(max(10, n_beats * 0.4), 5))
+    ax.bar(np.arange(n_beats), votes, color=colors,
+           alpha=0.75, width=0.8)
+    ax.axhline(N_LEADS_REQUIRED, color="black", ls="--", lw=1.8,
+               label=f"Consensus threshold = {N_LEADS_REQUIRED}/12")
+    ax.set_xlabel("Beat index", fontsize=11)
+    ax.set_ylabel("Number of leads voting CLEAN", fontsize=11)
+    ax.set_ylim(0, 13)
+    ax.set_yticks(range(0, 13))
+    ax.set_title(
+        f"Per-beat consensus vote — {meta['record_id']}\n"
+        f"Green = passes ({N_LEADS_REQUIRED}/12), Red = excluded  |  "
+        f"{int(consensus.sum())}/{n_beats} beats kept for training",
+        fontsize=12, fontweight="bold"
+    )
+    handles = [
+        mpatches.Patch(color="green", alpha=0.75,
+                       label="Consensus CLEAN → use for training"),
+        mpatches.Patch(color="red",   alpha=0.75,
+                       label="Consensus EXCLUDED → skip"),
+        plt.Line2D([0], [0], color="black", ls="--",
+                   label=f"Required votes = {N_LEADS_REQUIRED}"),
+    ]
+    ax.legend(handles=handles, fontsize=9, loc="lower right")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Saved → {save_path}")
+    plt.show()
+    return fig
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    # ── Step 1: Run pipeline ──────────────────────────────────────────────
+    result = run_single_record(MAT_PATH, HEA_PATH, verbose=True)
+
+    # ── Step 2: How to use output for ML training ─────────────────────────
+    print("\n" + "=" * 65)
+    print("HOW TO USE OUTPUT FOR TRAINING")
+    print("=" * 65)
+    print(f"  consensus_beat_mask shape : {result['consensus_beat_mask'].shape}")
+    print(f"  True  = use for training  : {result['n_beats_clean']}")
+    print(f"  False = exclude           : {result['n_beats_excluded']}")
+    print()
+    print("  Per-lead clean beat windows (all gated by SAME mask):")
+    for ln, beats in result["consensus_clean_beats"].items():
+        shape_str = str(beats.shape) if beats.size > 0 else "empty"
+        print(f"    Lead {ln:>4s} : {shape_str}")
+
+    # Build (n_clean, n_leads, win_len) training tensor
+    clean_list = [
+        result["consensus_clean_beats"].get(ln)
+        for ln in result["lead_names"]
+        if (result["consensus_clean_beats"].get(ln) is not None
+            and result["consensus_clean_beats"][ln].size > 0)
+    ]
+    if clean_list:
+        min_len = min(b.shape[1] for b in clean_list)
+        aligned = [b[:, :min_len] for b in clean_list]
+        training_tensor = np.stack(aligned, axis=1)
+        print(f"\n  Training tensor shape : {training_tensor.shape}")
+        print(f"  Interpretation        : (beats, leads, time_samples)")
+
+    # ── Step 3: Plots ─────────────────────────────────────────────────────
+    mid = result["meta"]["record_id"]
+    print("\nGenerating plots...")
+
+    plot_consensus_vote_summary(
+        result,
+        save_path=os.path.join(SAVE_DIR, f"{mid}_vote_summary.png"))
+
+    plot_single_lead_ppg_style(
+        result, lead_name="II",
+        save_path=os.path.join(SAVE_DIR, f"{mid}_II_sqi.png"))
+
+    plot_all_leads_summary(
+        result,
+        save_path=os.path.join(SAVE_DIR, f"{mid}_all_leads.png"))
+
+    print(f"\nAll outputs saved to {SAVE_DIR}")
+    print("Done.")
