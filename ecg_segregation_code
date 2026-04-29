@@ -1,0 +1,460 @@
+import glob, os, collections, re
+
+# ============================================================
+# DATASET ROOTS
+# ============================================================
+DATASETS = {
+    "PTB":        "/kaggle/input/datasets/organizations/physionet/ptb-diagnostic-ecg-database/Training_PTB",
+    "CPSC":       "/kaggle/input/datasets/marufhs/cpsc-2020/classification-of-12-lead-ecgs-the-physionetcomputing-in-cardiology-challenge-2020-1.0.2/training/cpsc_2018",
+    "CPSC_Extra": "/kaggle/input/datasets/marufhs/cpsc-2020/classification-of-12-lead-ecgs-the-physionetcomputing-in-cardiology-challenge-2020-1.0.2/training/cpsc_2018_extra",
+    "PTBXL":      "/kaggle/input/datasets/organizations/physionet/ptbxl-electrocardiography-database/WFDB",
+    "Chapman":    "/kaggle/input/datasets/erarayamorenzomuten/chapmanshaoxing-12lead-ecg-database/WFDB_ChapmanShaoxing",
+    "Georgia":    "/kaggle/input/datasets/organizations/physionet/georgia-12lead-ecg-challenge-database/Georgia",
+}
+
+# ============================================================
+# CLASS 0 — NORMAL
+# Codes that represent a clean, healthy ECG.
+# ============================================================
+NORMAL_CODES = {
+    '426783006',       # Sinus rhythm / Normal sinus rhythm (NSR)
+    '427084000',       # Sinus tachycardia  ← borderline but still "normal variant"
+    '67741000119109',  # Normal sinus rhythm with sinus tachycardia
+}
+
+# ============================================================
+# CLASS 1 — MI  (Myocardial Infarction + direct ischaemia)
+# Codes that directly indicate infarction or active ischaemic
+# ST/T changes that define MI on ECG.
+# ============================================================
+MI_CODES = {
+    '22298006',    # Myocardial infarction (generic)
+    '57054005',    # Acute myocardial infarction
+    '164865005',   # Old / chronic myocardial infarction  (OMI)
+    '164867002',   # Subendocardial MI  (NSTEMI pattern)
+    '164861001',   # Anterior MI
+    '164862008',   # Anterolateral MI
+    '164863003',   # Inferior MI
+    '164864009',   # Posterior MI
+    '429622005',   # Inferior STEMI
+    '164931005',   # ST elevation — anterior leads
+    '164930006',   # ST elevation (generic)
+    '55930002',    # ST elevation (alt SNOMED)
+    '425623009',   # ST segment depression  (ischaemia marker)
+    '54329005',    # Acute inferior MI
+    '164857002',   # Old anterior MI
+    '164858007',   # Old inferior MI
+    '164861001',   # Anterior ST elevation
+}
+
+# ============================================================
+# CLASS 2 — MIMIC  (MI-mimicking patterns)
+# Conduction defects and ECG abnormalities that cause ST/T
+# changes which can look like MI but are not infarction.
+# ============================================================
+MIMIC_CODES = {
+    # Bundle branch blocks
+    '164909002',   # Left bundle branch block  (LBBB)
+    '59118001',    # Right bundle branch block  (RBBB)
+    '713427006',   # Complete RBBB
+    '713426002',   # Incomplete RBBB  (IRBBB)
+    '445118002',   # Left anterior fascicular block  (LAFB)
+    '445211001',   # Left posterior fascicular block  (LPFB)
+    '713422000',   # Incomplete LBBB
+    '6374002',     # Bundle branch block, unspecified
+    '253352002',   # Nonspecific intraventricular conduction delay
+    '698247007',   # Intraventricular conduction delay
+    '75532003',    # Right ventricular conduction delay
+
+    # AV blocks
+    '233917008',   # Atrioventricular block  (generic AVB)
+    '270492004',   # First-degree AV block  (1-AVB) — also in PhysioNet as I-AVB
+    '54016002',    # First-degree AV block  (alt code)
+    '426434006',   # Second-degree AV block
+    '27885002',    # Complete (third-degree) AV block
+    '251139008',   # PR interval abnormality
+
+    # Hypertrophy (voltage patterns mimicking MI)
+    '164873001',   # Left ventricular hypertrophy — voltage criteria  (LVH)
+    '55827005',    # Left ventricular hypertrophy  (alt SNOMED)
+    '164912004',   # Left ventricular hypertrophy  (structural)
+    '89792004',    # Right ventricular hypertrophy  (RVH)
+
+    # Nonspecific ST-T changes (mimic ischaemia)
+    '428750005',   # Nonspecific ST-T wave changes  (NSSTC)
+    '164934002',   # T-wave abnormality  (TWA)
+    '164917005',   # ST segment abnormality, nonspecific  (STSA)
+    '164951009',   # Abnormal ECG, nonspecific  (AECG)
+    '59931005',    # T-wave inversion  (TWI)
+    '251199005',   # Nonspecific ST-T change  (alt)
+    '251200008',   # ST depression, nonspecific
+    '251198002',   # Poor R-wave progression  (PRWP)
+    '251266004',   # ST abnormality lateral leads
+    '251268003',   # ST abnormality inferior leads
+    '164942001',   # Q-wave abnormality
+    '164895002',   # Junctional rhythm
+
+    # Low voltage / axis oddities that mimic MI
+    '251146004',   # Low QRS voltage  (LQRSV)
+    '164890007',   # Atrial flutter  (can have pseudo-ST in inferior leads)
+
+    # PAC — causes early beats that briefly distort ST
+    '284470004',   # Premature atrial contraction  (PAC)
+    '63593006',    # Supraventricular premature beat  (SVPB) — broader PAC family
+    '251170000',   # Blocked premature atrial contraction  (blocked PAC)
+
+    # Chronic ischaemia — ST-T changes that mimic MI without acute infarction
+    '413844008',   # Chronic myocardial ischaemia  (CMI) — persistent ST-T depression
+
+    # Atrial enlargement — voltage/morphology mimic
+    '446813000',   # Left atrial hypertrophy / enlargement  (LAH/LAE)
+    '253339007',   # Right atrial abnormality  (RAA)
+
+    # Inferior ST depression — nonspecific ischaemic-looking change
+    '704997005',   # Inferior ST segment depression  (finding)
+
+    # Voltage abnormality that can suggest ischaemia
+    '370365005',   # ECG left ventricular strain pattern  (LV strain)
+    '251259000',   # High T-voltage  (tall T waves — hyperkalaemia / early ischaemia mimic)
+
+    # Intraventricular conduction — broad QRS mimicking MI
+    '82226007',    # Diffuse intraventricular block
+}
+
+# ============================================================
+# CLASS 3 — OTHER  (arrhythmias, axis, structural, misc)
+# Everything else that is abnormal but is neither MI nor a
+# direct MI mimic.
+# ============================================================
+OTHER_CODES = {
+    # Atrial arrhythmias
+    '164889003',   # Atrial fibrillation  (AF / AFIB)
+    '427393009',   # Supraventricular tachycardia  (SVT)
+    '195042002',   # Atrial tachycardia  (AT)
+    '17366009',    # Atrial tachycardia  (alt)
+    '426648003',   # Accelerated AV conduction
+    '426664006',   # Non-sustained VT  (NSVT)
+    '81898007',    # Ventricular tachycardia  (VT)
+    '49578007',    # Atrial flutter / fibrillation  (alt)
+    '314208002',   # Rapid AF
+    '282825002',   # Paroxysmal AF
+
+    # Sinus variants
+    '426177001',   # Sinus bradycardia  (SB)
+    '195080001',   # Sinus arrhythmia
+    '195060002',   # Sinus pause / sinus arrest
+    '266249003',   # Sinoatrial block / sinus exit block
+    '426627000',   # Bradycardia (generic)
+
+    # Ventricular ectopy
+    '427172004',   # Premature ventricular contraction  (PVC)
+    '17338001',    # Ventricular ectopic beat
+    '11157007',    # Ventricular bigeminy
+    '428417006',   # Frequent PVCs
+    '164921003',   # Accelerated idioventricular rhythm
+    '233897008',   # Junctional escape rhythm
+    '426995002',   # Escape beat
+    '164896001',   # Idioventricular rhythm
+    '426761007',   # Accelerated junctional rhythm
+
+    # Axis deviations
+    '164884008',   # Left axis deviation  (LAD)
+    '698252002',   # Right axis deviation  (RAD)
+    '39732003',    # Left axis deviation  (alt SNOMED)
+    '47665007',    # Right axis deviation  (alt SNOMED)
+    '251120003',   # Left axis deviation  (alt — used by PTB-XL)
+    '251122006',   # Right axis deviation  (alt — listed in PhysioNet scoring)
+    '251166008',   # QRS axis abnormality
+    '13640000',    # Fascicular block, unspecified
+
+    # Interval / waveform abnormalities
+    '111975006',   # Prolonged QT interval  (LQTS)
+    '164947007',   # Prolonged PR interval
+    '74390002',    # Wolff-Parkinson-White syndrome  (WPW)
+    '446358003',   # RBBB + left axis deviation pattern
+
+    # Enlargement / hypertrophy (non-voltage)
+    '425419005',   # Right atrial enlargement / P-pulmonale  (RAE)
+    '195126007',   # Atrial flutter with variable block
+
+    # Ventricular trigeminy / ectopic groupings
+    '251180001',   # Ventricular trigeminy  (every 3rd beat is PVC)
+    '29320008',    # Ectopic beats, unspecified
+
+    # Sinoatrial conduction
+    '65778007',    # Sinoatrial block  (SA block / sinus exit block)
+
+    # Tachycardia–bradycardia
+    '74615001',    # Tachycardia-bradycardia syndrome  (sick sinus)
+
+    # Ventricular flutter — severe but not MI
+    '111288001',   # Ventricular flutter
+
+    # QT interval
+    '77867006',    # Shortened QT interval  (short QT syndrome)
+
+    # Chronic AF variant
+    '426749004',   # Chronic atrial fibrillation
+
+    # Pacing
+    '10370003',    # Paced rhythm
+
+    # Voltage / waveform variants
+    '251173003',   # P-wave abnormality
+    '251164006',   # Notched P-wave
+    '164937009',   # Abnormal P-wave axis
+
+    # Miscellaneous structural / systemic
+    '53741008',    # Coronary artery disease (ECG marker)
+    '84114007',    # Heart failure (ECG pattern)
+    '204384007',   # Congenital heart condition (general)
+    '67198005',    # Digitalis effect pattern
+    '195101003',   # Bundle branch block, unspecified
+    '67751000119106',  # RBBB with inferior MI pattern (Other — MI component already in MI set)
+    '413444003',   # Inappropriate sinus tachycardia
+    '368009',      # Atrial or junctional ectopic beat
+    '164896001',   # Escape rhythm
+}
+
+# ============================================================
+# COMBINED LOOKUP AND CLASS NAMES
+# ============================================================
+ALL_KNOWN  = NORMAL_CODES | MI_CODES | MIMIC_CODES | OTHER_CODES
+CLASS_NAMES = {0: "Normal", 1: "MI", 2: "Mimic", 3: "Other", -1: "Unknown"}
+
+# Priority: MI > Mimic > Other > Normal > Unknown
+def snomed_to_class(dx_codes):
+    s = set(dx_codes)
+    if s & MI_CODES:     return 1
+    if s & MIMIC_CODES:  return 2
+    if s & OTHER_CODES:  return 3
+    if s & NORMAL_CODES: return 0
+    return -1
+
+
+# ============================================================
+# ROBUST .hea PARSER
+# Handles every #Dx variant seen across PhysioNet datasets:
+#   #Dx: 270492004,164889003
+#   # Dx: 270492004
+#   #Dx 270492004,164889003
+#   #dx:270492004
+# Also accepts 5-digit codes (some CPSC codes are 5 digits).
+# ============================================================
+def parse_dx(hea_path):
+    try:
+        with open(hea_path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                stripped = line.strip()
+                # Match any line whose comment starts with #dx (case-insensitive)
+                if re.match(r'#\s*dx', stripped, re.IGNORECASE):
+                    # Strip the '#dx' prefix (with optional spaces and colon)
+                    rest = re.sub(r'^#\s*dx\s*:?\s*', '', stripped, flags=re.IGNORECASE)
+                    # Extract all digit runs of 5+ digits (SNOMED codes are 6–18 digits;
+                    # some CPSC codes are 5-digit — keep >=5 to be safe)
+                    codes = re.findall(r'\b\d{5,}\b', rest)
+                    if codes:
+                        return codes
+    except Exception:
+        pass
+    return []
+
+
+# ============================================================
+# DEBUG HELPER — call once on a dataset to diagnose issues
+# ============================================================
+def diagnose_dataset(ds_name, root, n=5):
+    """Print the raw #Dx (or equivalent) lines from the first n .hea files."""
+    hea_files = sorted(
+        set(glob.glob(os.path.join(root, "**/*.hea"), recursive=True) +
+            glob.glob(os.path.join(root, "*.hea")))
+    )[:n]
+    print(f"\n{'='*60}")
+    print(f"DIAGNOSTICS — {ds_name}  (first {n} records)")
+    print(f"{'='*60}")
+    for hp in hea_files:
+        print(f"\n  File: {hp}")
+        try:
+            with open(hp, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            comment_lines = [l.rstrip() for l in lines if l.strip().startswith('#')]
+            if comment_lines:
+                for cl in comment_lines:
+                    print(f"    {cl}")
+            else:
+                print("    (no comment lines found — showing last 3 lines)")
+                for l in lines[-3:]:
+                    print(f"    {l.rstrip()}")
+        except Exception as e:
+            print(f"    ERROR: {e}")
+    print(f"\n{'='*60}\n")
+
+
+# ============================================================
+# SCAN
+# ============================================================
+# Run diagnostics on CPSC first so you can see the raw lines
+for ds_name in ("CPSC", "CPSC_Extra"):
+    root = DATASETS[ds_name]
+    if os.path.isdir(root):
+        diagnose_dataset(ds_name, root, n=5)
+
+ds_record_counts = {}
+ds_code_counts   = {}
+combined_counts  = collections.defaultdict(int)
+all_unmapped     = collections.Counter()
+
+for ds_name, root in DATASETS.items():
+    if not os.path.isdir(root):
+        print(f"[SKIP] {ds_name} — root not found: {root}")
+        ds_record_counts[ds_name] = {}
+        continue
+
+    hea_files = sorted(set(
+        glob.glob(os.path.join(root, "**/*.hea"), recursive=True) +
+        glob.glob(os.path.join(root, "*.hea"))
+    ))
+
+    class_counts = collections.defaultdict(int)
+    code_counter = collections.Counter()
+
+    for hp in hea_files:
+        dx  = parse_dx(hp)
+        cls = snomed_to_class(dx)
+        class_counts[cls] += 1
+        combined_counts[cls]  += 1
+        code_counter.update(dx)
+        for c in dx:
+            if c not in ALL_KNOWN:
+                all_unmapped[c] += 1
+
+    ds_record_counts[ds_name] = dict(class_counts)
+    ds_code_counts[ds_name]   = code_counter
+    print(f"[{ds_name}] scanned {sum(class_counts.values())} records  "
+          f"| unknown: {class_counts.get(-1,0)}")
+
+
+# ============================================================
+# PRINT — RECORDS PER CLASS PER DATASET
+# ============================================================
+print("\n" + "=" * 72)
+print(f"{'RECORDS PER CLASS — ALL DATASETS':^72}")
+print("=" * 72)
+
+col_w  = 10
+header = (f"{'Dataset':<14}" +
+          "".join(f"{CLASS_NAMES[c]:>{col_w}}" for c in range(-1, 4)) +
+          f"{'TOTAL':>{col_w}}")
+print(header)
+print("─" * len(header))
+
+grand_total = 0
+for ds_name in DATASETS:
+    cc = ds_record_counts.get(ds_name, {})
+    if not cc:
+        continue
+    row_total = sum(cc.values())
+    grand_total += row_total
+    row = f"{ds_name:<14}"
+    for c in range(-1, 4):
+        row += f"{cc.get(c, 0):>{col_w}}"
+    row += f"{row_total:>{col_w}}"
+    print(row)
+
+print("─" * len(header))
+row = f"{'ALL COMBINED':<14}"
+for c in range(-1, 4):
+    row += f"{combined_counts.get(c, 0):>{col_w}}"
+row += f"{grand_total:>{col_w}}"
+print(row)
+print("=" * len(header))
+print("Columns: Unknown(-1)  Normal(0)  MI(1)  Mimic(2)  Other(3)")
+
+
+# ============================================================
+# PRINT — SNOMED CODE FREQUENCY PER DATASET
+# ============================================================
+print("\n" + "=" * 72)
+print("SNOMED CODE FREQUENCY — PER DATASET")
+print("=" * 72)
+
+for ds_name, counter in ds_code_counts.items():
+    if not counter:
+        continue
+    print(f"\n  [{ds_name}]")
+    print(f"  {'Code':<20} {'Count':>6}  Class")
+    print(f"  {'─'*44}")
+    for code, count in counter.most_common():
+        if   code in MI_CODES:     lbl = "MI      (1)"
+        elif code in MIMIC_CODES:  lbl = "Mimic   (2)"
+        elif code in OTHER_CODES:  lbl = "Other   (3)"
+        elif code in NORMAL_CODES: lbl = "Normal  (0)"
+        else:                      lbl = "*** UNMAPPED ***"
+        print(f"  {code:<20} {count:>6}  {lbl}")
+
+
+# ============================================================
+# PRINT — REMAINING UNMAPPED CODES
+# ============================================================
+print("\n" + "=" * 72)
+print("REMAINING UNMAPPED SNOMED CODES")
+print("=" * 72)
+if all_unmapped:
+    print(f"  {'Code':<20} {'Total':>8}  (paste into SNOMED browser to identify)")
+    print(f"  {'─'*40}")
+    for code, count in all_unmapped.most_common():
+        print(f"  {code:<20} {count:>8}")
+else:
+    print("  All codes mapped — no unknowns.")
+
+
+# ============================================================
+# PRINT — CLASS PRIORITY & MAPPING NOTES
+# ============================================================
+print("""
+================================================================
+MAPPING NOTES
+================================================================
+Priority: MI(1) > Mimic(2) > Other(3) > Normal(0) > Unknown(-1)
+A record with BOTH an MI code and a MIMIC code → assigned MI(1).
+
+Key design decisions:
+  • Sinus tachycardia (427084000) → Normal(0)
+      Rationale: ST alone is a normal variant in the dataset context.
+      Move to Other(3) if you want it treated as an arrhythmia.
+
+  • T-wave abnormality (164934002) → Mimic(2)
+      Rationale: TWA is the most common nonspecific ST-T mimic.
+
+  • ST depression (425623009) → MI(1)
+      Rationale: In the CinC challenge scoring, STD = ischaemia.
+      Move to Mimic(2) if you want a conservative MI definition.
+
+  • PAC / SVPB / blocked PAC (284470004, 63593006, 251170000) → Mimic(2)
+      Rationale: premature atrial beats cause pseudo-ST distortion.
+
+  • Chronic myocardial ischaemia (413844008) → Mimic(2)
+      Rationale: persistent ST-T depression without acute infarction.
+      Move to MI(1) if your task treats chronic ischaemia as MI.
+
+  • Left atrial hypertrophy (446813000) → Mimic(2)
+      Rationale: causes ST-T changes that resemble lateral ischaemia.
+
+  • Right atrial abnormality (253339007) → Mimic(2)
+  • Inferior ST depression (704997005) → Mimic(2)
+  • LV strain pattern (370365005) → Mimic(2)
+  • High T-voltage (251259000) → Mimic(2)
+  • Diffuse intraventricular block (82226007) → Mimic(2)
+
+  • Ventricular trigeminy (251180001) → Other(3)
+  • Ectopic beats unspecified (29320008) → Other(3)
+  • Sinoatrial block (65778007) → Other(3)
+  • Tachycardia-bradycardia / sick sinus (74615001) → Other(3)
+  • Ventricular flutter (111288001) → Other(3)
+  • Shortened QT (77867006) → Other(3)
+  • Chronic AF (426749004) → Other(3)
+
+  • CPSC / CPSC_Extra — if still 100% Unknown after this script,
+      run the DIAGNOSTICS block above and paste the raw output here.
+================================================================
+""")
